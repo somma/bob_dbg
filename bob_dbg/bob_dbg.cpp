@@ -27,7 +27,15 @@ bool get_filepath_by_handle(
     
 static bool _initial_bp = false;
 
-static DWORD _debuggee_pid = 0;
+typedef struct DEBUGGEE
+{
+	bool		_initial_bp_hit;
+	uint32_t	_pid;
+} *PDEBUGGEE;
+
+static DEBUGGEE _debuggees[12] = { {false, 0}, };
+
+int debuggee_count = 0;
 
 
 /// @brief
@@ -55,7 +63,8 @@ int main()
 	}
 
     log("process created. pid = %u", pi.dwProcessId);
-    _debuggee_pid = pi.dwProcessId;
+	_debuggees[0]._initial_bp_hit = false;
+	_debuggees[0]._pid = pi.dwProcessId;
 
 	CloseHandle(pi.hThread);
 	CloseHandle(pi.hProcess);
@@ -73,54 +82,54 @@ int main()
         {
         case EXCEPTION_DEBUG_EVENT:
             {
-                //LPEXCEPTION_DEBUG_INFO edi = &debug_event.u.Exception;
-                //switch (edi->ExceptionRecord.ExceptionCode)
-                //{
-                //case EXCEPTION_BREAKPOINT:
-                //    if (true != _initial_bp)
-                //    {
-                //        _initial_bp = true;
-                //        log(
-                //            "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, initial bp triggered at 0x%llx", 
-                //            debug_event.dwProcessId, 
-                //            debug_event.dwThreadId,
-                //            edi->ExceptionRecord.ExceptionAddress);
-                //    }
-                //    else
-                //    {
-                //        log(
-                //            "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, handle bp at 0x%llx", 
-                //            debug_event.dwProcessId,
-                //            debug_event.dwThreadId,
-                //            edi->ExceptionRecord.ExceptionAddress);
-                //    }
-                //    break;
-                //case EXCEPTION_SINGLE_STEP:
-                //    log(
-                //        "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, handle single step at 0x%llx", 
-                //        debug_event.dwProcessId,
-                //        debug_event.dwThreadId, 
-                //        edi->ExceptionRecord.ExceptionAddress);
-                //    break;
-                //default:
-                //    if (0 != edi->dwFirstChance)
-                //    {   
-                //        log("EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, %s (first chance) at 0x%llux",
-                //            debug_event.dwProcessId,
-                //            debug_event.dwThreadId, 
-                //            exception_code_str(edi->ExceptionRecord.ExceptionCode),
-                //            edi->ExceptionRecord.ExceptionAddress
-                //            );
-                //    }
-                //    else
-                //    {
-                //        log("EXCEPTION_DEBUG_EVENT, %s (second chance) at 0x%llux, can't handle anymore.",
-                //            exception_code_str(edi->ExceptionRecord.ExceptionCode),
-                //            edi->ExceptionRecord.ExceptionAddress
-                //            );
-                //    }
-                //    break;
-                //}
+                LPEXCEPTION_DEBUG_INFO edi = &debug_event.u.Exception;
+                switch (edi->ExceptionRecord.ExceptionCode)
+                {
+                case EXCEPTION_BREAKPOINT:
+                    if (true != _initial_bp)
+                    {
+                        _initial_bp = true;
+                        log(
+                            "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, initial bp triggered at 0x%llx", 
+                            debug_event.dwProcessId, 
+                            debug_event.dwThreadId,
+                            edi->ExceptionRecord.ExceptionAddress);
+                    }
+                    else
+                    {
+                        log(
+                            "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, handle bp at 0x%llx", 
+                            debug_event.dwProcessId,
+                            debug_event.dwThreadId,
+                            edi->ExceptionRecord.ExceptionAddress);
+                    }
+                    break;
+                case EXCEPTION_SINGLE_STEP:
+                    log(
+                        "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, handle single step at 0x%llx", 
+                        debug_event.dwProcessId,
+                        debug_event.dwThreadId, 
+                        edi->ExceptionRecord.ExceptionAddress);
+                    break;
+                default:
+                    if (0 != edi->dwFirstChance)
+                    {   
+                        log("EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, %s (first chance) at 0x%llux",
+                            debug_event.dwProcessId,
+                            debug_event.dwThreadId, 
+                            exception_code_str(edi->ExceptionRecord.ExceptionCode),
+                            edi->ExceptionRecord.ExceptionAddress
+                            );
+                    }
+                    else
+                    {
+                        log("EXCEPTION_DEBUG_EVENT, %s (second chance) at 0x%llux, can't handle anymore.",
+                            exception_code_str(edi->ExceptionRecord.ExceptionCode),
+                            edi->ExceptionRecord.ExceptionAddress
+                            );
+                    }
+                    break;
+                }
 
                 continue_status = DBG_EXCEPTION_NOT_HANDLED;
                 break;
@@ -149,18 +158,28 @@ int main()
                     cpi->lpStartAddress
                     );
                 
+				for (int i = 0; i < sizeof(_debuggees) / sizeof(DEBUGGEE); ++i)
+				{
+					if (_debuggees[i]._pid == 0)
+					{
+						_debuggees[i]._initial_bp_hit = 0;
+						_debuggees[i]._pid = debug_event.dwProcessId;
+					}
+				}
+				debuggee_count++;
                 break;
             }
         case EXIT_THREAD_DEBUG_EVENT:
             {
                 //str = "EXIT_THREAD_DEBUG_EVENT";
-                break;
+                
+				break;
             }
-        //case EXIT_PROCESS_DEBUG_EVENT:
-        //    {
-        //        str = "EXIT_PROCESS_DEBUG_EVENT";
-        //        break;
-        //    }
+    //    case EXIT_PROCESS_DEBUG_EVENT:
+    //        {
+    //            str = "EXIT_PROCESS_DEBUG_EVENT";
+				//break;
+    //        }
         case LOAD_DLL_DEBUG_EVENT:
             {
                 LPLOAD_DLL_DEBUG_INFO lddi = &debug_event.u.LoadDll;
@@ -225,7 +244,19 @@ int main()
             //-------
             // debuggee ?
             // child of debuggee ?
-            if (_debuggee_pid == debug_event.dwProcessId)
+			int i = 0;
+
+			for (; i < debuggee_count; ++i)
+			{
+				if (_debuggees[i]._pid == debug_event.dwProcessId) 
+				{
+					_debuggees[i]._initial_bp_hit = 0;
+					_debuggees[i]._pid = 0;
+					debuggee_count--;
+					break;
+				}
+			}
+            if (i = 0)
             {
                 log("EXIT_PROCESS_DEBUG_EVENT, debuggee is terminated. pid = %u, tid = %u", debug_event.dwProcessId, debug_event.dwThreadId);
                 break;
