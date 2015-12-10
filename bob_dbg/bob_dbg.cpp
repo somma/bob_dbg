@@ -12,6 +12,10 @@
 #include <Windows.h>
 #include <Psapi.h>
 
+#include "cpu_helper.h"
+
+#define     _pause  _getch()
+
 const char* exception_code_str(_In_ DWORD exception_code);
 bool get_mapped_file_name(
     _In_ HANDLE process_handle,
@@ -27,8 +31,29 @@ bool get_filepath_by_handle(
     
 static bool _initial_bp = false;
 
-static DWORD _debuggee_pid = 0;
+typedef struct DEBUGGEE
+{
+    bool        _initial_bp_hit;
+    uint32_t    _pid;
 
+    // CREATE_PROCESS_DEBUG_INFO 
+    HANDLE      _file_handle;
+    HANDLE      _proc_handle;
+    HANDLE      _thread_handle;
+    LPVOID      _base_of_image;
+    LPVOID      _thread_local_base;
+    /*LPTHREAD_START_ROUTINE*/ 
+    void*       _start_address;
+    std::wstring _image_name;
+
+    // break point
+    ch_param    _bp_param;  // todo : bp 여러개 처리하기
+    void*       _bp_addr;
+    uint8_t     _opcode;
+    
+} *PDEBUGGEE;
+
+static DEBUGGEE _debuggees[12] = { {false, 0}, };
 
 /// @brief
 int main()
@@ -55,7 +80,6 @@ int main()
 	}
 
     log("process created. pid = %u", pi.dwProcessId);
-    _debuggee_pid = pi.dwProcessId;
 
 	CloseHandle(pi.hThread);
 	CloseHandle(pi.hProcess);
@@ -65,64 +89,153 @@ int main()
 	{
 		if (TRUE != WaitForDebugEvent(&debug_event, 100)) continue;
         
-        
         DWORD continue_status = DBG_CONTINUE;
-
 
 		switch (debug_event.dwDebugEventCode)
         {
         case EXCEPTION_DEBUG_EVENT:
             {
-                //LPEXCEPTION_DEBUG_INFO edi = &debug_event.u.Exception;
-                //switch (edi->ExceptionRecord.ExceptionCode)
-                //{
-                //case EXCEPTION_BREAKPOINT:
-                //    if (true != _initial_bp)
-                //    {
-                //        _initial_bp = true;
-                //        log(
-                //            "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, initial bp triggered at 0x%llx", 
-                //            debug_event.dwProcessId, 
-                //            debug_event.dwThreadId,
-                //            edi->ExceptionRecord.ExceptionAddress);
-                //    }
-                //    else
-                //    {
-                //        log(
-                //            "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, handle bp at 0x%llx", 
-                //            debug_event.dwProcessId,
-                //            debug_event.dwThreadId,
-                //            edi->ExceptionRecord.ExceptionAddress);
-                //    }
-                //    break;
-                //case EXCEPTION_SINGLE_STEP:
-                //    log(
-                //        "EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, handle single step at 0x%llx", 
-                //        debug_event.dwProcessId,
-                //        debug_event.dwThreadId, 
-                //        edi->ExceptionRecord.ExceptionAddress);
-                //    break;
-                //default:
-                //    if (0 != edi->dwFirstChance)
-                //    {   
-                //        log("EXCEPTION_DEBUG_EVENT, pid = %u, tid = %u, %s (first chance) at 0x%llux",
-                //            debug_event.dwProcessId,
-                //            debug_event.dwThreadId, 
-                //            exception_code_str(edi->ExceptionRecord.ExceptionCode),
-                //            edi->ExceptionRecord.ExceptionAddress
-                //            );
-                //    }
-                //    else
-                //    {
-                //        log("EXCEPTION_DEBUG_EVENT, %s (second chance) at 0x%llux, can't handle anymore.",
-                //            exception_code_str(edi->ExceptionRecord.ExceptionCode),
-                //            edi->ExceptionRecord.ExceptionAddress
-                //            );
-                //    }
-                //    break;
-                //}
+                PDEBUGGEE dbge = NULL;
+                for (int i = 0; i < sizeof(_debuggees) / sizeof(DEBUGGEE); ++i)
+                {
+                    if (_debuggees[i]._pid == debug_event.dwProcessId)
+                    {
+                        dbge = &_debuggees[i];
+                    }
+                }
+                if (NULL == dbge) break;
+                
+                LPEXCEPTION_DEBUG_INFO edi = &debug_event.u.Exception;
+                switch (edi->ExceptionRecord.ExceptionCode)
+                {
+                case EXCEPTION_BREAKPOINT:
+                    if (true != dbge->_initial_bp_hit)
+                    {
+                        dbge->_initial_bp_hit = true;
+                        log(
+                            "\n"
+                            "[EXCEPTION_DEBUG_EVENT] \n"\
+                            "   img = %ws \n"\
+                            "   pid = %u, tid = %u \n"\
+                            "   + initial bp triggered at 0x%llx", 
+                            dbge->_image_name.c_str(),
+                            debug_event.dwProcessId, 
+                            debug_event.dwThreadId,
+                            edi->ExceptionRecord.ExceptionAddress);
 
-                continue_status = DBG_EXCEPTION_NOT_HANDLED;
+                        // 
+                        // install breakpoint at ep.
+                        // 
+
+                        dbge->_bp_param = { 0 };
+                        HANDLE thread_handle = OpenThread(THREAD_ALL_ACCESS, FALSE, debug_event.dwThreadId);
+                        if (NULL == thread_handle)
+                        {
+                            _ASSERTE(!"oops");
+                            break;
+                        }
+
+                        dbge->_bp_param.hthread = thread_handle;
+                        dbge->_bp_param.hproc = dbge->_proc_handle;
+                        dbge->_bp_addr = dbge->_start_address;
+                        bool bp_ret = set_break_point(
+                                            &dbge->_bp_param,
+                                            (DWORD_PTR)dbge->_bp_addr,
+                                            &dbge->_opcode);
+                        if (true != bp_ret)
+                        {
+                            _ASSERTE(true == bp_ret);
+                            break;
+                        }
+
+                        continue_status = DBG_EXCEPTION_HANDLED;
+                        log("   + break point installed at 0x%llx", dbge->_bp_addr);                        
+                        _pause;
+                    }
+                    else
+                    {
+                        log(
+                            "\n"
+                            "[EXCEPTION_DEBUG_EVENT] \n"\
+                            "   img = %ws \n"\
+                            "   pid = %u, tid = %u \n"\
+                            "   + break point at 0x%llx", 
+                            dbge->_image_name.c_str(),
+                            debug_event.dwProcessId,
+                            debug_event.dwThreadId,
+                            edi->ExceptionRecord.ExceptionAddress);
+
+                        // 
+                        // restore opcode and resume
+                        //
+                        if (edi->ExceptionRecord.ExceptionAddress != dbge->_bp_addr)
+                        {
+                            _ASSERTE(!"oops");
+                            break;
+                        }
+                                                
+                        dbge->_bp_param.context.ContextFlags  = CONTEXT_ALL;
+                        if (TRUE != GetThreadContext(
+                                            dbge->_bp_param.hthread, 
+                                            &dbge->_bp_param.context))
+                        {
+                            _ASSERTE(!"oops!");
+                            break;
+                        }
+                        if (true != clear_break_point(
+                                            &dbge->_bp_param, 
+                                            (DWORD_PTR)dbge->_bp_addr, 
+                                            dbge->_opcode, true))
+                        {
+                            _ASSERTE(!"oops");
+                            break;
+                        }
+
+                        continue_status = DBG_EXCEPTION_HANDLED;
+                        log("   + breakpoint un-installed at 0x%llx", dbge->_bp_addr);                        
+                        _pause;
+                    }
+                    break;
+
+                case EXCEPTION_SINGLE_STEP:
+                    log(
+                        "\n"
+                        "[EXCEPTION_DEBUG_EVENT] \n"\
+                        "   pid = %u, tid = %u\n"\
+                        "   + handle single step at 0x%llx", 
+                        debug_event.dwProcessId,
+                        debug_event.dwThreadId, 
+                        edi->ExceptionRecord.ExceptionAddress);
+                    continue_status = DBG_EXCEPTION_NOT_HANDLED;
+                    _pause;
+                    break;
+
+                default:
+                    if (0 != edi->dwFirstChance)
+                    {   
+                        log("\n"
+                            "[EXCEPTION_DEBUG_EVENT]\n"\
+                            "   pid = %u, tid = %u\n"\
+                            "   + %s (first chance) at 0x%llx",
+                            debug_event.dwProcessId,
+                            debug_event.dwThreadId, 
+                            exception_code_str(edi->ExceptionRecord.ExceptionCode),
+                            edi->ExceptionRecord.ExceptionAddress
+                            );
+                    }
+                    else
+                    {
+                        log("\n"
+                            "[EXCEPTION_DEBUG_EVENT]\n"\
+                            "   + %s (second chance) at 0x%llx, can't handle anymore.",
+                            exception_code_str(edi->ExceptionRecord.ExceptionCode),
+                            edi->ExceptionRecord.ExceptionAddress
+                            );
+                    }
+
+                    continue_status = DBG_EXCEPTION_NOT_HANDLED;
+                    break;
+                }
                 break;
             }
         case CREATE_THREAD_DEBUG_EVENT:
@@ -133,22 +246,40 @@ int main()
         case CREATE_PROCESS_DEBUG_EVENT:
             {
                 LPCREATE_PROCESS_DEBUG_INFO cpi = &debug_event.u.CreateProcessInfo;
-                
-                
                 std::wstring image;
                 if (true != get_filepath_by_handle(cpi->hFile, image))
                 {
                     image = L"unknown image path";
                 }
                 
-                log("CREATE_PROCESS_DEBUG_EVENT, pid = %u, tid = %u, img = %ws, ep = 0x%llx",
+                log("\n"\
+                    "[CREATE_PROCESS_DEBUG_EVENT]\n"\
+                    "   img = %ws\n"\
+                    "   pid = %u, tid = %u, ep = 0x%llx",
+                    image.c_str(), 
                     debug_event.dwProcessId,
                     debug_event.dwThreadId,
-                    //cpi->lpImageName, 
-                    image.c_str(),
                     cpi->lpStartAddress
                     );
                 
+                for (int i = 0; i < sizeof(_debuggees) / sizeof(DEBUGGEE); ++i)
+                {
+                    if (_debuggees[i]._pid == 0)
+                    {
+                        _debuggees[i]._initial_bp_hit = 0;
+                        _debuggees[i]._pid = debug_event.dwProcessId;
+
+                        _debuggees[i]._file_handle = debug_event.u.CreateProcessInfo.hFile;
+                        _debuggees[i]._proc_handle = debug_event.u.CreateProcessInfo.hProcess;
+                        _debuggees[i]._thread_handle = debug_event.u.CreateProcessInfo.hThread;
+                        _debuggees[i]._base_of_image = debug_event.u.CreateProcessInfo.lpBaseOfImage;
+                        _debuggees[i]._thread_local_base = debug_event.u.CreateProcessInfo.lpThreadLocalBase;
+                        _debuggees[i]._start_address = debug_event.u.CreateProcessInfo.lpStartAddress;
+                        _debuggees[i]._image_name = image;
+
+                        break;
+                    }
+                }
                 break;
             }
         case EXIT_THREAD_DEBUG_EVENT:
@@ -163,6 +294,8 @@ int main()
         //    }
         case LOAD_DLL_DEBUG_EVENT:
             {
+                break;
+
                 LPLOAD_DLL_DEBUG_INFO lddi = &debug_event.u.LoadDll;
                 std::wstring dll_path;
                 if (true != get_filepath_by_handle(lddi->hFile, dll_path))
@@ -170,7 +303,9 @@ int main()
                     dll_path = L"Unknown dll path";
                 }
 
-                log("LOAD_DLL_DEBUG_EVENT, pid = %u, tid = %u, img = %ws",
+                log("\n"
+                    "[LOAD_DLL_DEBUG_EVENT]\n"\
+                    "   pid = %u, tid = %u, img = %ws",
                     debug_event.dwProcessId,
                     debug_event.dwThreadId,
                     dll_path.c_str()
@@ -221,16 +356,29 @@ int main()
 		//> debuggee is terminating
 		if (EXIT_PROCESS_DEBUG_EVENT == debug_event.dwDebugEventCode)
 		{
-            // todo #1
-            //-------
-            // debuggee ?
-            // child of debuggee ?
-            if (_debuggee_pid == debug_event.dwProcessId)
+            int i = 0;
+            for (; i < sizeof(_debuggees) / sizeof(DEBUGGEE); ++i)
             {
-                log("EXIT_PROCESS_DEBUG_EVENT, debuggee is terminated. pid = %u, tid = %u", debug_event.dwProcessId, debug_event.dwThreadId);
-                break;
+                if (_debuggees[i]._pid == debug_event.dwProcessId)
+                {
+                    _debuggees[i]._initial_bp_hit = 0;
+                    _debuggees[i]._pid = 0;
+                    break;
+                }
             }
 
+            if (i == 0)
+            {
+                log("\n"\
+                    "[EXIT_PROCESS_DEBUG_EVENT] \n"\
+                    "   img = %ws\n"\
+                    "   pid = %u, tid = %u\n"\
+                    "   + debuggee is terminated.",
+                    _debuggees[i]._image_name.c_str(),
+                    debug_event.dwProcessId, debug_event.dwThreadId);
+                _pause;
+                break;
+            }
             // do nothing...
 		}
 	}
