@@ -8,16 +8,14 @@
 **/
 
 #include "stdafx.h"
-
 #include <Windows.h>
-
+#include <list>
 
 #define     _pause  getchar()
 
 /// @brief  debuggee process 정보
 typedef struct DEBUGGEE
 {
-    bool    busy;
     DWORD   process_id;
     HANDLE  process_handle;
     HANDLE  thread_handle;
@@ -32,7 +30,9 @@ typedef struct DEBUGGEE
 /// @brief
 int main()
 {
-    DEBUGGEE dbg[12] = { 0 };
+    //DEBUGGEE dbg[12] = { 0 };
+    std::list<DEBUGGEE> dbg_list;
+
     
     // create process with /dbg
     STARTUPINFO			si = { 0 };
@@ -73,24 +73,12 @@ int main()
             {
                 LPCREATE_PROCESS_DEBUG_INFO info = (LPCREATE_PROCESS_DEBUG_INFO)&debug_event.u.CreateProcessInfo;
                 
-                PDEBUGGEE pdbg = NULL;
-                for (int i = 0; i < sizeof(dbg); i++)
-                {
-                    if (dbg[i].busy != true)
-                    {
-                        pdbg = &dbg[i];
-                        break;
-                    }
-                }
-                if (NULL == pdbg)
-                {
-                    return -1;      // 아몰랑.
-                }
-
-                pdbg->process_id = debug_event.dwProcessId;
-                pdbg->process_handle = info->hProcess;
-                pdbg->thread_handle = info->hThread;
-                pdbg->busy = true;
+                // debuggee 할당/추가
+                DEBUGGEE dbg = { 0 };
+                dbg.process_id = debug_event.dwProcessId;
+                dbg.process_handle = info->hProcess;
+                dbg.thread_handle = info->hThread;
+                dbg_list.push_back(dbg);
                 break;
             }
         default:
@@ -99,35 +87,29 @@ int main()
 
         if (EXIT_PROCESS_DEBUG_EVENT == debug_event.dwDebugEventCode)
         {  
-            PDEBUGGEE pdbg = NULL;
-            for (int i = 0; i < sizeof(dbg); i++)
+            std::list<DEBUGGEE>::iterator it = dbg_list.begin();
+            for (; it != dbg_list.end(); ++it)
             {
-                if (dbg[i].process_id == debug_event.dwProcessId)
+                if (it->process_id == debug_event.dwProcessId)
                 {
-                    pdbg = &dbg[i];
-                    break;
+                    /// 정보 출력
+                    printf("proc handle=0x%p \n", it->process_handle);
+                    printf("main thrad handle=0x%p \n", it->thread_handle);
+                    break;  // debuggee 가 종료되면, debug loop 도 끝내야 한다.
                 }
             }
-            if (NULL == pdbg)
-            {
-                return -1;      // 아몰랑.
-            }
-            pdbg->busy = false;
-
-
-            if (debug_event.dwProcessId == dbg[0].process_id)
-            {
-                /// 정보 출력
-                printf("proc handle=0x%p \n", dbg[0].process_handle);
-                printf("main thrad handle=0x%p \n", dbg[0].thread_handle);
-                break;  // debuggee 가 종료되면, debug loop 도 끝내야 한다.
-            }
+            dbg_list.erase(it);
         }
 
         ContinueDebugEvent(
             debug_event.dwProcessId,
             debug_event.dwThreadId,
             continue_status);
+
+        if (dbg_list.empty())
+        {
+            break;
+        }
 
     }
 
